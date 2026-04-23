@@ -14,6 +14,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/util/httputil"
 	"github.com/tidwall/gjson"
 )
 
@@ -59,6 +60,7 @@ const (
 	openAI403CooldownMinutesDefault = 10
 	openAI403DisableThreshold       = 3
 	openAI403CounterWindowMinutes   = 180
+	openAICloudflareChallengeTTL    = 15 * time.Minute
 )
 
 // NewRateLimitService 创建RateLimitService实例
@@ -264,7 +266,7 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 			upstreamMsg,
 			truncateForLog(responseBody, 1024),
 		)
-		shouldDisable = s.handle403(ctx, account, upstreamMsg, responseBody)
+		shouldDisable = s.handle403(ctx, account, headers, upstreamMsg, responseBody)
 	case 429:
 		s.handle429(ctx, account, headers, responseBody)
 		shouldDisable = false
@@ -696,12 +698,12 @@ func buildForbiddenErrorMessage(prefix string, upstreamMsg string, responseBody 
 // handle403 处理 403 Forbidden 错误
 // Antigravity 平台区分 validation/violation/generic 三种类型，均 SetError 永久禁用；
 // 其他平台保持原有 SetError 行为。
-func (s *RateLimitService) handle403(ctx context.Context, account *Account, upstreamMsg string, responseBody []byte) (shouldDisable bool) {
+func (s *RateLimitService) handle403(ctx context.Context, account *Account, headers http.Header, upstreamMsg string, responseBody []byte) (shouldDisable bool) {
 	if account.Platform == PlatformAntigravity {
 		return s.handleAntigravity403(ctx, account, upstreamMsg, responseBody)
 	}
 	if account.Platform == PlatformOpenAI {
-		return s.handleOpenAI403(ctx, account, upstreamMsg, responseBody)
+		return s.handleOpenAI403(ctx, account, headers, upstreamMsg, responseBody)
 	}
 	// 非 Antigravity 平台：保持原有行为
 	msg := buildForbiddenErrorMessage(
@@ -714,7 +716,32 @@ func (s *RateLimitService) handle403(ctx context.Context, account *Account, upst
 	return true
 }
 
-func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account, upstreamMsg string, responseBody []byte) (shouldDisable bool) {
+func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account, headers http.Header, upstreamMsg string, responseBody []byte) (shouldDisable bool) {
+	if httputil.IsCloudflareChallengeResponse(http.StatusForbidden, headers, responseBody) {
+		msg := httputil.FormatCloudflareChallengeMessage(
+			"Cloudflare challenge encountered while forwarding request",
+			headers,
+			responseBody,
+		)
+		if upstreamMsg != "" {
+			msg += ": " + upstreamMsg
+		}
+		until := time.Now().Add(openAICloudflareChallengeTTL)
+		reason := fmt.Sprintf("OpenAI Cloudflare challenge temporary cooldown: %s", msg)
+		if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {
+			slog.Warn("openai_cloudflare_challenge_set_temp_unschedulable_failed", "account_id", account.ID, "error", err)
+			s.handleAuthError(ctx, account, msg)
+			return true
+		}
+		slog.Warn(
+			"openai_cloudflare_challenge_temp_unschedulable",
+			"account_id", account.ID,
+			"until", until,
+			"reason", reason,
+		)
+		return true
+	}
+
 	msg := buildForbiddenErrorMessage(
 		"Access forbidden (403):",
 		upstreamMsg,
