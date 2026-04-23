@@ -198,21 +198,21 @@ fi
 if [[ "${TARGET_SERVICE}" == "all" ]]; then
   log "开始发布整套服务"
   run_compose up -d
-  wait_for_health sub2api-postgres
-  wait_for_health sub2api-redis
-  wait_for_health sub2api
+  wait_for_health sub2api-postgres 30
+  wait_for_health sub2api-redis 30
+  wait_for_health sub2api 120
 else
   log "开始发布服务: ${TARGET_SERVICE}"
   run_compose up -d "${TARGET_SERVICE}"
   case "${TARGET_SERVICE}" in
     postgres)
-      wait_for_health sub2api-postgres
+      wait_for_health sub2api-postgres 30
       ;;
     redis)
-      wait_for_health sub2api-redis
+      wait_for_health sub2api-redis 30
       ;;
     sub2api)
-      wait_for_health sub2api
+      wait_for_health sub2api 120
       ;;
   esac
 fi
